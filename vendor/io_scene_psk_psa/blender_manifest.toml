@@ -1,0 +1,30 @@
+schema_version = "1.0.0"
+id = "io_scene_psk_psa"
+version = "9.1.2"
+name = "Unreal PSK/PSA (.psk/.psa)"
+tagline = "Import and export PSK and PSA files used in Unreal Engine"
+maintainer = "Colin Basnett <cmbasnett@gmail.com>"
+type = "add-on"
+website = "https://github.com/DarklightGames/io_scene_psk_psa/"
+tags = ["Game Engine", "Import-Export"]
+blender_version_min = "5.0.0"
+# Optional: maximum supported Blender version
+# blender_version_max = "5.1.0"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+wheels = [
+  './wheels/psk_psa_py-0.0.4-py3-none-any.whl'
+]
+
+[build]
+paths_exclude_pattern = [
+  "/.git/",
+  "__pycache__/",
+  "/venv/",
+  "/.github/",
+  ".gitignore",
+]
+
+[permissions]
+files = "Read and write PSK and PSA files from and to disk"

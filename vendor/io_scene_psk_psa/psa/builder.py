@@ -1,0 +1,378 @@
+from bpy.types import Action, AnimData, Context, Object, PoseBone
+
+from psk_psa_py.psa.data import Psa
+from typing import Tuple
+from mathutils import Matrix, Quaternion, Vector
+
+from ..shared.helpers import PsxBoneCollection, convert_bpy_quaternion_to_psx_quaternion, convert_vector_to_vector3, create_psx_bones, get_coordinate_system_transform
+
+
+class PsaBuildSequence:
+    class NlaState:
+        def __init__(self):
+            self.action: Action | None = None
+            self.frame_start: int = 0
+            self.frame_end: int = 0
+
+    def __init__(self, armature_object: Object, anim_data: AnimData):
+        self.armature_object = armature_object
+        self.anim_data = anim_data
+        self.name: str = ''
+        self.nla_state: PsaBuildSequence.NlaState = PsaBuildSequence.NlaState()
+        self.compression_ratio: float = 1.0
+        self.key_quota: int = 0
+        self.fps: float = 30.0
+        self.group: str | None = None
+
+
+class PsaBuildOptions:
+    def __init__(self):
+        self.armature_objects: list[Object] = []
+        self.animation_data: AnimData | None = None
+        self.sequences: list[PsaBuildSequence] = []
+        self.bone_filter_mode: str = 'ALL'
+        self.bone_collection_indices: list[PsxBoneCollection] = []
+        self.sequence_name_prefix: str = ''
+        self.sequence_name_suffix: str = ''
+        self.scale = 1.0
+        self.sampling_mode: str = 'INTERPOLATED'  # One of ('INTERPOLATED', 'SUBFRAME')
+        self.export_space = 'WORLD'
+        self.forward_axis = 'X'
+        self.up_axis = 'Z'
+        self.sequence_source = 'ACTIONS'  # One of ('ACTIONS', 'TIMELINE_MARKERS', 'NLA_STRIPS')
+    
+    @property
+    def bone_collection_primary_key(self) -> str:
+        return 'DATA' if self.sequence_source == 'ACTIVE_ACTION' else 'OBJECT'
+
+
+class PsaExportBone:
+    def __init__(self,
+                    pose_bone: PoseBone | None,
+                    armature_object: Object | None,
+                    scale: Vector):
+        self.pose_bone = pose_bone
+        self.armature_object = armature_object
+        self.scale = scale
+    
+    @property
+    def is_armature_root_bone(self) -> bool:
+        return self.pose_bone is not None and self.pose_bone.parent is None
+    
+    @property
+    def is_attached_to_armature(self) -> bool:
+        return self.get_attached_armature() is not None
+    
+    def get_attached_armature(self) -> tuple[Object, PoseBone] | None:
+        if not self.is_armature_root_bone:
+            return None
+        assert self.armature_object is not None
+        match self.armature_object.parent_type:
+            case 'BONE':
+                parent_bone_name = self.armature_object.parent_bone
+                assert self.armature_object.parent is not None
+                parent_armature_object = self.armature_object.parent
+                assert parent_armature_object.pose is not None
+                parent_pose_bone = parent_armature_object.pose.bones.get(parent_bone_name)
+                if parent_pose_bone is None:
+                    return None
+                return (parent_armature_object, parent_pose_bone)
+            case _:
+                return None
+    
+    def get_attached_armature_transform(self) -> Matrix:
+        attached_armature, attached_pose_bone = self.get_attached_armature() or (None, None)
+        if attached_armature is None or attached_pose_bone is None:
+            return Matrix.Identity(4)
+        if attached_pose_bone.parent is not None:
+            attached_bone_matrix = attached_pose_bone.parent.matrix.inverted() @ attached_pose_bone.matrix
+        else:
+            attached_bone_matrix = attached_armature.matrix_world @ attached_pose_bone.matrix
+        return attached_bone_matrix
+
+def _get_pose_bone_location_and_rotation(
+    pose_bone: PoseBone,
+    armature_object: Object,
+    export_bone: PsaExportBone,
+    export_space: str,
+    scale: Vector,
+    coordinate_system_transform: Matrix,
+) -> Tuple[Vector, Quaternion]:
+    if pose_bone.parent is not None:
+        pose_bone_matrix = pose_bone.parent.matrix.inverted() @ pose_bone.matrix
+    else:
+        # Root bone
+        # Get the bone's pose matrix and transform it into the export space.
+        # In the case of an 'ARMATURE' export space, this will be the inverse of armature object's world matrix.
+        # Otherwise, it will be the identity matrix.
+
+        if export_bone.is_attached_to_armature:
+            # Get the world space matrix of both this bone and the bone that we're attached to,
+            # then calculate a matrix relative to the attached bone.
+            world_matrix = armature_object.matrix_world @ pose_bone.matrix
+            assert export_bone.armature_object
+            my_parent = export_bone.armature_object.parent
+            assert my_parent
+            my_parent_bone = export_bone.armature_object.parent_bone
+            assert my_parent.pose
+            parent_pose_bone = my_parent.pose.bones[my_parent_bone]
+            parent_world_matrix = my_parent.matrix_world @ parent_pose_bone.matrix
+            pose_bone_matrix = parent_world_matrix.inverted() @ world_matrix
+        else:
+            match export_space:
+                case 'ARMATURE':
+                    pose_bone_matrix = pose_bone.matrix
+                case 'WORLD':
+                    pose_bone_matrix = armature_object.matrix_world @ pose_bone.matrix
+                case 'ROOT':
+                    pose_bone_matrix = Matrix.Identity(4)
+                case _:
+                    assert False, f'Invalid export space: {export_space}'
+            # The root bone is the only bone that should be transformed by the coordinate system transform, since all
+            # other bones are relative to their parent bones.
+            pose_bone_matrix = coordinate_system_transform @ pose_bone_matrix
+
+    location = pose_bone_matrix.to_translation()
+    rotation = pose_bone_matrix.to_quaternion().normalized()
+
+    if pose_bone.parent is not None:
+        # Don't apply scale to the root bone of armatures if we have a false root.
+        # TODO: probably remove this?
+        location *= scale
+        rotation.conjugate()
+
+    return location, rotation
+
+
+def build_psa(context: Context, options: PsaBuildOptions) -> Psa:
+
+    assert context.scene
+    assert context.window_manager
+
+    psa = Psa()
+
+    armature_objects_for_bones = options.armature_objects
+    if options.sequence_source == 'ACTIVE_ACTION' and len(options.armature_objects) >= 2:
+        # Make sure that the data-block for all the selected armature objects is the same.
+        if any(map(lambda o: o.data != options.armature_objects[0].data, options.armature_objects[1:])):
+            raise RuntimeError('All armature objects must share the same data-block when exporting from the active action')
+        armature_objects_for_bones = [options.armature_objects[0]]
+
+    psx_bone_create_result = create_psx_bones(
+        armature_objects=armature_objects_for_bones,
+        export_space=options.export_space,
+        forward_axis=options.forward_axis,
+        up_axis=options.up_axis,
+        scale=options.scale,
+        bone_filter_mode=options.bone_filter_mode,
+        bone_collection_indices=options.bone_collection_indices,
+        bone_collection_primary_key=options.bone_collection_primary_key,
+    )
+
+    # Build list of PSA bones.
+    # Note that the PSA bones are just here to validate the hierarchy.
+    # The bind pose information is not used by the engine.
+    psa.bones = [bone.psx_bone for bone in psx_bone_create_result.bones]
+
+    # No bones are going to be exported.
+    if len(psa.bones) == 0:
+        raise RuntimeError('No bones available for export')
+
+    # Add prefixes and suffices to the names of the export sequences and strip whitespace.
+    for export_sequence in options.sequences:
+        export_sequence.name = f'{options.sequence_name_prefix}{export_sequence.name}{options.sequence_name_suffix}'
+        export_sequence.name = export_sequence.name.strip()
+
+    # Save each armature object's current action and frame so that we can restore the state once we are done.
+    saved_armature_object_actions = {o: (o.animation_data.action if o.animation_data else None) for o in options.armature_objects}
+    saved_frame_current = context.scene.frame_current
+
+    # Now build the PSA sequences.
+    # We actually alter the timeline frame and simply record the resultant pose bone matrices.
+    frame_start_index = 0
+
+    context.window_manager.progress_begin(0, len(options.sequences))
+
+    coordinate_system_transform = get_coordinate_system_transform(options.forward_axis, options.up_axis)
+
+    for export_sequence_index, export_sequence in enumerate(options.sequences):
+        frame_start = export_sequence.nla_state.frame_start
+        frame_end = export_sequence.nla_state.frame_end
+
+        # Calculate the frame step based on the compression factor.
+        frame_extents = abs(frame_end - frame_start)
+        frame_count_raw = frame_extents + 1
+        frame_count = max(1, max(export_sequence.key_quota, int(frame_count_raw * export_sequence.compression_ratio)))
+        frame_step = frame_extents / (frame_count - 1) if frame_count > 1 else 0.0
+
+        # If this is a reverse sequence, we need to reverse the frame step.
+        if frame_start > frame_end:
+            frame_step = -frame_step
+
+        sequence_duration = frame_count_raw / export_sequence.fps
+
+        psa_sequence = Psa.Sequence()
+        
+        try:
+            psa_sequence.name = bytes(export_sequence.name, encoding='windows-1252')
+        except UnicodeEncodeError:
+            raise RuntimeError(
+                f'Sequence name "{export_sequence.name}" contains characters that cannot be encoded in the Windows-1252 codepage')
+        
+        try:
+            if export_sequence.group is not None:
+                psa_sequence.group = bytes(export_sequence.group, encoding='windows-1252')
+        except UnicodeDecodeError:
+            raise RuntimeError(
+                f'Group name "{export_sequence.group} contains characters that cannot be encoded in the Windows-1252 codepage')
+        
+        psa_sequence.frame_count = frame_count
+        psa_sequence.frame_start_index = frame_start_index
+        psa_sequence.fps = frame_count / sequence_duration
+        psa_sequence.bone_count = len(psa.bones)
+        psa_sequence.track_time = frame_count
+        psa_sequence.key_reduction = 1.0
+
+        frame = float(frame_start)
+
+        # Link the action to the animation data and update view layer.
+        for armature_object in options.armature_objects:
+            if armature_object.animation_data:
+                armature_object.animation_data.action = export_sequence.nla_state.action
+
+        assert context.view_layer
+        context.view_layer.update()
+
+        def add_key(location: Vector, rotation: Quaternion):
+            key = Psa.Key()
+            key.location = convert_vector_to_vector3(location)
+            key.rotation = convert_bpy_quaternion_to_psx_quaternion(rotation)
+            key.time = 1.0 / psa_sequence.fps
+            psa.keys.append(key)
+
+        armature_scales: dict[Object, Vector] = {}
+
+        # Extract the scale from the world matrix of the evaluated armature object.
+        for armature_object in options.armature_objects:
+            evaluated_armature_object = armature_object.evaluated_get(context.evaluated_depsgraph_get())
+            _, _, scale = evaluated_armature_object.matrix_world.decompose()
+            scale *= options.scale
+            armature_scales[armature_object] = scale
+
+        # Create a list of export pose bones, in the same order as the bones as they appear in the armature.
+        # The object contains the pose bone, the armature object, and a pre-calculated scaling value to apply to the
+        # locations.
+        export_bones: list[PsaExportBone] = []
+
+        for bone in psx_bone_create_result.bones:
+            if bone.armature_object is None:
+                export_bone = PsaExportBone(None, None, Vector((1.0, 1.0, 1.0)))
+                export_bones.append(export_bone)
+                continue
+
+            assert bone.armature_object.pose
+            pose_bone = bone.armature_object.pose.bones[bone.psx_bone.name.decode('windows-1252')]
+
+            export_bones.append(PsaExportBone(pose_bone, bone.armature_object, armature_scales[bone.armature_object]))
+
+        match options.sampling_mode:
+            case 'INTERPOLATED':
+                # Used as a store for the last frame's pose bone locations and rotations.
+                last_frame: int | None = None
+                last_frame_bone_poses: list[tuple[Vector, Quaternion]] = []
+
+                next_frame: int | None = None
+                next_frame_bone_poses: list[tuple[Vector, Quaternion]] = []
+
+                for _ in range(frame_count):
+                    if last_frame is None or last_frame != int(frame):
+                        # Populate the bone poses for frame A.
+                        last_frame = int(frame)
+
+                        # TODO: simplify this code and make it easier to follow!
+                        if next_frame == last_frame:
+                            # Simply transfer the data from next_frame to the last_frame so that we don't need to
+                            # resample anything.
+                            last_frame_bone_poses = next_frame_bone_poses.copy()
+                        else:
+                            last_frame_bone_poses.clear()
+                            context.scene.frame_set(frame=last_frame)
+                            for export_bone in export_bones:
+                                location, rotation = _get_pose_bone_location_and_rotation(
+                                    export_bone.pose_bone,
+                                    export_bone.armature_object,
+                                    export_bone,
+                                    options.export_space,
+                                    export_bone.scale,
+                                    coordinate_system_transform=coordinate_system_transform
+                                )
+                                last_frame_bone_poses.append((location, rotation))
+
+                        next_frame = None
+                        next_frame_bone_poses.clear()
+
+                    # If this is not a subframe, just use the last frame's bone poses.
+                    if frame % 1.0 == 0:
+                        for i in range(len(export_bones)):
+                            add_key(*last_frame_bone_poses[i])
+                    else:
+                        # Otherwise, this is a subframe, so we need to interpolate the pose between the next frame and the last frame.
+                        if next_frame is None:
+                            next_frame = last_frame + 1
+                            context.scene.frame_set(frame=next_frame)
+                            for export_bone in export_bones:
+                                location, rotation = _get_pose_bone_location_and_rotation(
+                                    pose_bone=export_bone.pose_bone,
+                                    armature_object=export_bone.armature_object,
+                                    export_bone=export_bone,
+                                    export_space=options.export_space,
+                                    scale=export_bone.scale,
+                                    coordinate_system_transform=coordinate_system_transform,
+                                )
+                                next_frame_bone_poses.append((location, rotation))
+
+                        factor = frame % 1.0
+
+                        for i in range(len(export_bones)):
+                            last_location, last_rotation = last_frame_bone_poses[i]
+                            next_location, next_rotation = next_frame_bone_poses[i]
+
+                            location = last_location.lerp(next_location, factor)
+                            rotation = last_rotation.slerp(next_rotation, factor)
+
+                            add_key(location, rotation)
+
+                    frame += frame_step
+            case 'SUBFRAME':
+                for _ in range(frame_count):
+                    context.scene.frame_set(frame=int(frame), subframe=frame % 1.0)
+
+                    for export_bone in export_bones:
+                        location, rotation = _get_pose_bone_location_and_rotation(
+                            pose_bone=export_bone.pose_bone,
+                            armature_object=export_bone.armature_object,
+                            export_bone=export_bone,
+                            export_space=options.export_space,
+                            scale=export_bone.scale,
+                            coordinate_system_transform=coordinate_system_transform,
+                        )
+                        add_key(location, rotation)
+
+                    frame += frame_step
+
+        frame_start_index += frame_count
+
+        psa.sequences[export_sequence.name] = psa_sequence
+
+        context.window_manager.progress_update(export_sequence_index)
+
+    # Restore the previous actions & frame.
+    for armature_object, action in saved_armature_object_actions.items():
+        assert armature_object.animation_data
+        armature_object.animation_data.action = action
+
+    context.scene.frame_set(saved_frame_current)
+
+    context.window_manager.progress_end()
+
+    return psa

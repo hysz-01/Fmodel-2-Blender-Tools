@@ -1,0 +1,140 @@
+from .shared import (
+    types as shared_types,
+    helpers as shared_helpers,
+    dfs as shared_dfs,
+    ui as shared_ui,
+    operators as shared_operators,
+)
+from .psk import (
+    builder as psk_builder,
+    importer as psk_importer,
+    properties as psk_properties,
+    ui as psk_ui,
+) 
+from .psk.export import (
+    operators as psk_export_operators,
+    properties as psk_export_properties,
+    ui as psk_export_ui,
+)
+from .psk.import_ import (
+    operators as psk_import_operators,
+)
+from .psa import (
+    config as psa_config,
+    builder as psa_builder,
+    importer as psa_importer,
+    file_handlers as psa_file_handlers,
+)
+from .psa.export import (
+    properties as psa_export_properties,
+    ui as psa_export_ui,
+    operators as psa_export_operators,
+)
+from .psa.import_ import (
+    operators as psa_import_operators,
+    ui as psa_import_ui,
+    properties as psa_import_properties,
+)
+
+_needs_reload = 'bpy' in locals()
+
+if _needs_reload:
+    import importlib
+
+    importlib.reload(shared_helpers)
+    importlib.reload(shared_types)
+    importlib.reload(shared_dfs)
+    importlib.reload(shared_ui)
+    importlib.reload(shared_operators)
+
+    importlib.reload(psk_builder)
+    importlib.reload(psk_importer)
+    importlib.reload(psk_properties)
+    importlib.reload(psk_ui)
+    importlib.reload(psk_export_properties)
+    importlib.reload(psk_export_operators)
+    importlib.reload(psk_export_ui)
+    importlib.reload(psk_import_operators)
+
+    importlib.reload(psa_config)
+    importlib.reload(psa_builder)
+    importlib.reload(psa_importer)
+    importlib.reload(psa_export_properties)
+    importlib.reload(psa_export_operators)
+    importlib.reload(psa_export_ui)
+    importlib.reload(psa_import_properties)
+    importlib.reload(psa_import_operators)
+    importlib.reload(psa_import_ui)
+    importlib.reload(psa_file_handlers)
+
+import bpy
+from bpy.props import PointerProperty
+
+
+def psk_export_menu_func(self, context):
+    self.layout.operator(psk_export_operators.PSK_OT_export.bl_idname, text='Unreal PSK (.psk)')
+
+
+def psk_import_menu_func(self, context):
+    self.layout.operator(psk_import_operators.PSK_OT_import.bl_idname, text='Unreal PSK (.psk/.pskx)')
+
+
+def psa_export_menu_func(self, context):
+    self.layout.operator(psa_export_operators.PSA_OT_export.bl_idname, text='Unreal PSA (.psa)')
+
+
+def psa_import_menu_func(self, context):
+    self.layout.operator(psa_import_operators.PSA_OT_import.bl_idname, text='Unreal PSA (.psa)')
+
+
+_modules = (
+    shared_types,
+    shared_ui,
+    shared_operators,
+    psk_properties,
+    psk_ui,
+    psk_import_operators,
+    psk_export_properties,
+    psk_export_operators,
+    psk_export_ui,
+    psa_export_properties,
+    psa_export_operators,
+    psa_export_ui,
+    psa_import_properties,
+    psa_import_operators,
+    psa_import_ui,
+    psa_file_handlers,
+)
+
+def register():
+    for module in _modules:
+        module.register()
+    bpy.types.TOPBAR_MT_file_export.append(psk_export_menu_func)
+    bpy.types.TOPBAR_MT_file_import.append(psk_import_menu_func)
+    bpy.types.TOPBAR_MT_file_export.append(psa_export_menu_func)
+    bpy.types.TOPBAR_MT_file_import.append(psa_import_menu_func)
+    setattr(bpy.types.Material, 'psk', PointerProperty(type=psk_properties.PSX_PG_material, options={'HIDDEN'}))
+    setattr(bpy.types.Scene, 'psx_export', PointerProperty(type=shared_types.PSX_PG_scene_export, options={'HIDDEN'}))
+    setattr(bpy.types.Scene, 'psa_import', PointerProperty(type=psa_import_properties.PSA_PG_import, options={'HIDDEN'}))
+    setattr(bpy.types.Scene, 'psa_export', PointerProperty(type=psa_export_properties.PSA_PG_export, options={'HIDDEN'}))
+    setattr(bpy.types.Scene, 'psk_export', PointerProperty(type=psk_export_properties.PSK_PG_export, options={'HIDDEN'}))
+    setattr(bpy.types.Action, 'psa_export', PointerProperty(type=shared_types.PSX_PG_action_export, options={'HIDDEN'}))
+
+
+def unregister():
+    delattr(bpy.types.Material, 'psk')
+    delattr(bpy.types.Scene, 'psx_export')
+    delattr(bpy.types.Scene, 'psa_import')
+    delattr(bpy.types.Scene, 'psa_export')
+    delattr(bpy.types.Scene, 'psk_export')
+    delattr(bpy.types.Action, 'psa_export')
+    bpy.types.TOPBAR_MT_file_export.remove(psk_export_menu_func)
+    bpy.types.TOPBAR_MT_file_import.remove(psk_import_menu_func)
+    bpy.types.TOPBAR_MT_file_export.remove(psa_export_menu_func)
+    bpy.types.TOPBAR_MT_file_import.remove(psa_import_menu_func)
+    for module in reversed(_modules):
+        module.unregister()
+
+
+if __name__ == '__main__':
+    register()

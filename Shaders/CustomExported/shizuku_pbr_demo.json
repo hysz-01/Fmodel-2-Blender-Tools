@@ -1,0 +1,47 @@
+{
+  "preset_id": "shizuku_pbr_demo",
+  "preset_label": "Shizuku PBR Demo",
+  "preset_desc": "01_Shizuku 测试模型 PBR 映射 — col→Base Color, Normal→Normal, Roughness→Roughness, Metallic→Metallic, opa→Alpha。法线无需翻转Y",
+  "preset_category": "PBR",
+  "version": "2.0",
+  "texture_processors": {
+    "base_color": {
+      "type": "direct",
+      "match": ["_col"],
+      "colorspace": "sRGB",
+      "required": true,
+      "outputs": { "default": { "socket": "Base Color" } }
+    },
+    "normal": {
+      "type": "normal_map",
+      "match": ["_Normal", "_normal", "_N"],
+      "colorspace": "Non-Color",
+      "outputs": { "default": { "socket": "Normal", "via": "NormalMap" } }
+    },
+    "roughness": {
+      "type": "direct",
+      "match": ["_Roughness", "_roughness"],
+      "colorspace": "Non-Color",
+      "fallback_value": 0.8,
+      "outputs": { "default": { "socket": "Roughness" } }
+    },
+    "metallic": {
+      "type": "direct",
+      "match": ["_Metallic", "_metallic"],
+      "colorspace": "Non-Color",
+      "fallback_value": 0.0,
+      "outputs": { "default": { "socket": "Metallic" } }
+    },
+    "alpha": {
+      "type": "direct",
+      "match": ["_opa", "_opacity"],
+      "colorspace": "Non-Color",
+      "outputs": { "default": { "socket": "Alpha" } }
+    }
+  },
+  "node_group_source": "FModel_PBR_Standard",
+  "ai_metadata": {
+    "source_game": "CelesAnime / UE NPR Shader",
+    "notes": "材质父类 MI_CelesAnimeMain。Metalic=0.0, Rough=0.8 为标量默认值，不作为贴图。_col Alpha 存透明度但由 _opa 独立贴图替代。法线为标准 OpenGL 无需翻转Y。"
+  }
+}

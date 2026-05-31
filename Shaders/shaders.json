@@ -1,0 +1,59 @@
+{
+  "defaults": {
+    "FModel_PBR_Standard": {
+      "label": "PBR Standard",
+      "description": "完整PBR材质模板 — 含Principled BSDF，法线混合开关、AO叠加、Subsurface、Emission",
+      "category": "PBR",
+      "interfaces": {
+        "Base Color": "base_color",
+        "Metallic": "metallic",
+        "Roughness": "roughness",
+        "Alpha": "alpha",
+        "AO Factor": null,
+        "AO": "ao",
+        "Normal": "normal",
+        "Normal Strength": null,
+        "自定义法向开关": null,
+        "Emission": "emission",
+        "Emission Strength": null,
+        "Subsurface Weight": null,
+        "Subsurface Radius": null,
+        "Subsurface Scale": null,
+        "Subsurface Anisotropy": null
+      }
+    },
+    "FModel_Custom_Base": {
+      "label": "Custom Base",
+      "description": "自定义基础模板 — 无BSDF，仅含AO叠加+法线混合预处理，输出可接任意BSDF",
+      "category": "Hybrid",
+      "interfaces": {
+        "Base Color": "base_color",
+        "Metallic": "metallic",
+        "Roughness": "roughness",
+        "Alpha": "alpha",
+        "AO Factor": null,
+        "AO": "ao",
+        "Normal": "normal",
+        "Normal Strength": null,
+        "自定义法向开关": null,
+        "Emission": "emission",
+        "Emission Strength": null
+      }
+    },
+    "FModel_NPR_Toon": {
+      "label": "NPR Toon",
+      "description": "NPR Toon",
+      "category": "NPR",
+      "interfaces": {
+        "Base Color": "Color",
+        "Normal": "Vector",
+        "Shadow Color": "Color",
+        "Highlight": "Color",
+        "Roughness": "Float",
+        "Emission": "Color",
+        "Alpha": "Float",
+        "Outline": "Float"
+      }
+    }
+  }
+}

@@ -1,0 +1,302 @@
+import re
+import sys
+from fnmatch import fnmatch
+from typing import Sequence
+import bpy
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    CollectionProperty,
+    IntProperty,
+    StringProperty,
+)
+from bpy.types import PropertyGroup, Object, Action, AnimData, Context
+
+from ...shared.dfs import dfs_view_layer_objects
+from ...shared.helpers import populate_bone_collection_list
+from ...shared.types import TransformMixin, ExportSpaceMixin, PsxBoneExportMixin, TransformSourceMixin
+
+
+def psa_export_property_group_animation_data_override_poll(_context, obj):
+    return obj.animation_data is not None
+
+
+class PsaExportSequenceMixin(PropertyGroup):
+    name: StringProperty(name='Name')
+    is_selected: BoolProperty(name='Selected', default=True)
+    frame_start: IntProperty(name='Start Frame', options={'HIDDEN'})
+    frame_end: IntProperty(name='End Frame', options={'HIDDEN'})
+    group: StringProperty(name='Group')
+    action_name: StringProperty(name='Action Name',default='', options={'HIDDEN'})
+    armature_object_name: StringProperty(name='Armature Object Name',default='', options={'HIDDEN'})
+    marker_index: IntProperty(name='Marker Index',default=-1, options={'HIDDEN'})
+    is_pose_marker: BoolProperty(name='Is Pose Marker',default=False, options={'HIDDEN'})
+
+    @property
+    def action(self) -> Action | None:
+        """Get the action associated with this sequence (if any)."""
+        return bpy.data.actions.get(self.action_name) if self.action_name else None
+
+    @property
+    def armature_object(self) -> Object | None:
+        """Get the armature object associated with this sequence (if any)."""
+        return bpy.data.objects.get(self.armature_object_name) if self.armature_object_name else None
+    
+    @property
+    def is_reversed(self) -> bool:
+        """Check if the sequence is reversed (end frame before start frame)."""
+        return self.frame_end < self.frame_start
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+
+class PSA_PG_export_sequence(PsaExportSequenceMixin):
+    pass
+
+
+def get_sequences_from_name_and_frame_range(name: str, frame_start: int, frame_end: int):
+    # Check for loop
+    anims: list[tuple[str, int, int]] = []
+    loop_pattern = r'\@(\d+)\:(.+)'
+    loop_match = re.match(loop_pattern, name)
+    if loop_match:
+        frame_count = max(1, int(loop_match.group(1)))
+        sequence_name = loop_match.group(2)
+        iteration = 0
+        frame = frame_start
+        while frame + frame_count <= frame_end:
+            output_name = sequence_name.format(index=iteration)
+            iteration_frame_start = frame
+            iteration_frame_end = frame + frame_count - 1
+            anims.append((output_name, iteration_frame_start, iteration_frame_end))
+            frame += frame_count
+            iteration += 1
+    else:
+        # If not, just treat it as a single animation, but parse for the reverse pattern as well.
+        anims.append((name, frame_start, frame_end))
+
+    for (name, frame_start, frame_end) in anims:
+        reversed_pattern = r'(.+)/(.+)'
+        reversed_match = re.match(reversed_pattern, name)
+        if reversed_match:
+            forward_name = reversed_match.group(1)
+            backwards_name = reversed_match.group(2)
+            yield forward_name, frame_start, frame_end
+            yield backwards_name, frame_end, frame_start
+        else:
+            yield name, frame_start, frame_end
+
+
+def nla_track_update_cb(self: 'PSA_PG_export', context: Context) -> None:
+    self.nla_strip_list.clear()
+    match = re.match(r'^(\d+).+$', self.nla_track)
+    self.nla_track_index = int(match.group(1)) if match else -1
+    if self.nla_track_index >= 0:
+        animation_data = get_animation_data(self, context)
+        if animation_data is None:
+            return
+        nla_track = animation_data.nla_tracks[self.nla_track_index]
+        for nla_strip in nla_track.strips:
+            for sequence_name, frame_start, frame_end in get_sequences_from_name_and_frame_range(nla_strip.name, nla_strip.frame_start, nla_strip.frame_end):
+                strip: PSA_PG_export_sequence = self.nla_strip_list.add()
+                strip.action_name = nla_strip.action
+                strip.name = sequence_name
+                strip.frame_start = frame_start
+                strip.frame_end = frame_end
+
+
+def get_animation_data(pg: 'PSA_PG_export', context: Context) -> AnimData | None:
+    animation_data_object = context.object
+    return animation_data_object.animation_data if animation_data_object else None
+
+
+def nla_track_search_cb(self, context: Context, edit_text: str):
+    pg = getattr(context.scene, 'psa_export')
+    animation_data = get_animation_data(pg, context)
+    if animation_data is not None:
+        for index, nla_track in enumerate(animation_data.nla_tracks):
+            yield f'{index} - {nla_track.name}'
+
+
+def animation_data_override_update_cb(self: 'PSA_PG_export', context: Context):
+    # Reset NLA track selection
+    self.nla_track = ''
+
+
+sequence_source_items = (
+    ('ACTIONS', 'Actions', 'Sequences will be exported using actions', 'ACTION', 0),
+    ('TIMELINE_MARKERS', 'Timeline Markers', 'Sequences are delineated by scene timeline markers', 'MARKER_HLT', 1),
+    ('NLA_TRACK_STRIPS', 'NLA Track Strips', 'Sequences are delineated by the start & end times of strips on the selected NLA track', 'NLA', 2),
+    ('ACTIVE_ACTION', 'Active Action', 'The active action will be exported for each selected armature', 'ACTION', 3),
+)
+
+fps_source_items = (
+    ('SCENE', 'Scene', '', 'SCENE_DATA', 0),
+    ('ACTION_METADATA', 'Action Metadata', 'The frame rate will be determined by action\'s FPS property found in the PSA Export panel.\n\nIf the Sequence Source is Timeline Markers, the lowest value of all contributing actions will be used', 'ACTION', 1),
+    ('CUSTOM', 'Custom', '', 2)
+)
+
+compression_ratio_source_items = (
+    ('ACTION_METADATA', 'Action Metadata', 'The compression ratio will be determined by action\'s Compression Ratio property found in the PSA Export panel.\n\nIf the Sequence Source is Timeline Markers, the lowest value of all contributing actions will be used', 'ACTION', 1),
+    ('CUSTOM', 'Custom', '', 2)
+)
+
+sampling_mode_items = (
+    ('INTERPOLATED', 'Interpolated', 'Sampling is performed by interpolating the evaluated bone poses from the adjacent whole frames.', 'INTERPOLATED', 0),
+    ('SUBFRAME', 'Subframe', 'Sampling is performed by evaluating the bone poses at the subframe time.\n\nNot recommended unless you are also animating with subframes enabled.', 'SUBFRAME', 1),
+)
+
+group_source_items = (
+    ('ACTIONS', 'Actions', '', 0),
+    ('CUSTOM', 'Custom', '', 1),
+)
+
+
+def sequence_source_update_cb(self: 'PSA_PG_export', context: Context) -> None:
+    armature_objects = []
+    assert context.view_layer
+    for dfs_object in dfs_view_layer_objects(context.view_layer):
+        if dfs_object.obj.type == 'ARMATURE' and dfs_object.is_selected:
+            armature_objects.append(dfs_object.obj)
+
+    populate_bone_collection_list(
+        self.bone_collection_list,
+        armature_objects,
+        primary_key='DATA' if self.sequence_source == 'ACTIVE_ACTION' else 'OBJECT')
+
+
+class PsaExportMixin(PropertyGroup, TransformMixin, ExportSpaceMixin, PsxBoneExportMixin, TransformSourceMixin):
+    sequence_source: EnumProperty(
+        name='Source',
+        options=set(),
+        description='',
+        items=sequence_source_items,
+        update=sequence_source_update_cb,
+    )
+    nla_track: StringProperty(
+        name='NLA Track',
+        options=set(),
+        description='',
+        search=nla_track_search_cb,
+        update=nla_track_update_cb
+    )
+    nla_track_index: IntProperty(name='NLA Track Index', default=-1)
+    fps_source: EnumProperty(
+        name='FPS Source',
+        options=set(),
+        description='',
+        items=fps_source_items,
+    )
+    fps_custom: FloatProperty(default=30.0, min=sys.float_info.epsilon, soft_min=1.0, options=set(), step=100, soft_max=60.0)
+    compression_ratio_source: EnumProperty(
+        name='Compression Ratio Source',
+        options=set(),
+        description='',
+        items=compression_ratio_source_items,
+    )
+    compression_ratio_custom: FloatProperty(default=1.0, min=0.0, max=1.0, subtype='FACTOR', description='The key sampling ratio of the exported sequence.\n\nA compression ratio of 1.0 will export all frames, while a compression ratio of 0.5 will export half of the frames')
+
+    action_list: CollectionProperty(type=PSA_PG_export_sequence)
+    action_list_index: IntProperty(default=0)
+    marker_list: CollectionProperty(type=PSA_PG_export_sequence)
+    marker_list_index: IntProperty(default=0)
+    nla_strip_list: CollectionProperty(type=PSA_PG_export_sequence)
+    nla_strip_list_index: IntProperty(default=0)
+    active_action_list: CollectionProperty(type=PSA_PG_export_sequence)
+    active_action_list_index: IntProperty(default=0)
+
+    sequence_name_prefix: StringProperty(name='Prefix', options=set())
+    sequence_name_suffix: StringProperty(name='Suffix', options=set())
+    sequence_filter_name: StringProperty(
+        default='',
+        name='Filter by Name',
+        options={'TEXTEDIT_UPDATE'},
+        description='Only show items matching this name (use \'*\' as wildcard)')
+    sequence_use_filter_invert: BoolProperty(
+        default=False,
+        name='Invert',
+        options=set(),
+        description='Invert filtering (show hidden items, and vice versa)')
+    sequence_filter_asset: BoolProperty(
+        default=False,
+        name='Show assets',
+        options=set(),
+        description='Show actions that belong to an asset library')
+    sequence_filter_pose_marker: BoolProperty(
+        default=True,
+        name='Show pose markers',
+        options=set())
+    sequence_use_filter_sort_reverse: BoolProperty(default=True, options=set())
+    sequence_filter_reversed: BoolProperty(
+        default=True,
+        options=set(),
+        name='Show Reversed',
+        description='Show reversed sequences'
+    )
+    sampling_mode: EnumProperty(
+        name='Sampling Mode',
+        options=set(),
+        description='The method by which frames are sampled',
+        items=sampling_mode_items,
+        default='INTERPOLATED'
+    )
+    group_source: EnumProperty(
+        name='Group Source',
+        options=set(),
+        description='The source of the exported sequence\'s group property',
+        items=group_source_items,
+        default='ACTIONS'
+    )
+    group_custom: StringProperty(
+        name='Group',
+        options=set(),
+        description='The group to apply to all exported sequences. Only applicable when Group Source is Custom.'
+    )
+
+class PSA_PG_export(PsaExportMixin):
+    pass
+
+
+def filter_sequences(pg: PsaExportMixin, sequences: Sequence[PsaExportSequenceMixin]) -> list[int]:
+    bitflag_filter_item = 1 << 30
+    flt_flags = [bitflag_filter_item] * len(sequences)
+
+    if pg.sequence_filter_name:
+        # Filter name is non-empty.
+        for i, sequence in enumerate(sequences):
+            if not fnmatch(sequence.name, f'*{pg.sequence_filter_name}*'):
+                flt_flags[i] &= ~bitflag_filter_item
+
+        # Invert filter flags for all items.
+        if pg.sequence_use_filter_invert:
+            for i, sequence in enumerate(sequences):
+                flt_flags[i] ^= bitflag_filter_item
+
+    if not pg.sequence_filter_asset:
+        for i, sequence in enumerate(sequences):
+            if sequence.action is not None and sequence.action.asset_data is not None:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    if not pg.sequence_filter_pose_marker:
+        for i, sequence in enumerate(sequences):
+            if sequence.is_pose_marker:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    if not pg.sequence_filter_reversed:
+        for i, sequence in enumerate(sequences):
+            if sequence.is_reversed:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    return flt_flags
+
+
+_classes = (
+    PSA_PG_export_sequence,
+    PSA_PG_export,
+)
+
+from bpy.utils import register_classes_factory
+register, unregister = register_classes_factory(_classes)
+
